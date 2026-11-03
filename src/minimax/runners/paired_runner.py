@@ -470,6 +470,8 @@ class PAIREDRunner:
 		Perform one update step: rollout teacher + students
 		"""
 		if self.n_devices > 1:
+			# Return a shared next key; only the working key is device-specific.
+			next_rng, rng = jax.random.split(rng)
 			rng = jax.random.fold_in(rng, jax.lax.axis_index('device'))
 
 		# === Reset teacher env + rollout teacher
@@ -589,6 +591,9 @@ class PAIREDRunner:
 		train_state = train_state.increment()
 		ued_train_state = ued_train_state.increment()
 		self.n_updates += 1
+
+		if self.n_devices > 1:
+			rng = next_rng
 
 		return (
 			stats, 

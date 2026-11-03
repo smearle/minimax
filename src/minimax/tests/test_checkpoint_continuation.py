@@ -7,6 +7,8 @@ import subprocess
 import sys
 
 import jax
+from jax.experimental.shard_map import shard_map
+from jax.sharding import Mesh
 import numpy as np
 import pytest
 
@@ -16,13 +18,15 @@ from minimax.runners.paired_runner import PAIREDRunner
 from minimax.runners.plr_runner import PLRRunner
 
 
-def make_runner(kind):
+def make_runner(kind, n_devices=1):
     model = models.make(env_name='Maze', model_name='default_student_cnn',
                         recurrent_arch='lstm', recurrent_hidden_dim=8,
                         n_conv_filters=4, hidden_dim=8)
-    agent = agents.PPOAgent(model=model, n_epochs=1, n_minibatches=1)
+    agent = agents.PPOAgent(model=model, n_epochs=1, n_minibatches=1,
+                            n_devices=n_devices)
     kwargs = dict(env_name='Maze', env_kwargs=dict(height=5, width=5, n_walls=2),
-                  student_agents=[agent], n_students=1 if kind == 'plr' else 2, n_parallel=2,
+                  student_agents=[agent], n_students=1 if kind == 'plr' else 2,
+                  n_parallel=2*n_devices, n_devices=n_devices,
                   n_eval=1, n_rollout_steps=4)
     if kind == 'dr':
         return DRRunner(**kwargs)
@@ -33,7 +37,8 @@ def make_runner(kind):
                           output_dim=25, recurrent_arch='lstm', recurrent_hidden_dim=8,
                           n_conv_filters=4, hidden_dim=8, n_scalar_embeddings=5,
                           max_scalar=4)
-    teacher_agent = agents.PPOAgent(model=teacher, n_epochs=1, n_minibatches=1)
+    teacher_agent = agents.PPOAgent(model=teacher, n_epochs=1, n_minibatches=1,
+                                   n_devices=n_devices)
     return PAIREDRunner(**kwargs, ued_env_kwargs=dict(n_walls=2),
                         teacher_agents=[teacher_agent])
 
@@ -96,23 +101,38 @@ def _assert_snapshot(state, expected, *, exact):
             np.testing.assert_allclose(value, target, atol=1e-7, rtol=1e-7)
 
 
-def _checkpoint_worker(mode, kind, folder):
-    runner = make_runner(kind)
+def _checkpoint_worker(mode, kind, folder, n_devices=1):
+    runner = make_runner(kind, n_devices)
+    run = runner.run
+    if n_devices > 1:
+        # Use the production runner's shard specifications directly. This tests
+        # continuation independently of ExperimentRunner's startup path.
+        mesh = Mesh(np.asarray(jax.local_devices()[:n_devices]), ('device',))
+        in_specs, out_specs = runner.get_shmap_spec()
+        run = jax.jit(shard_map(run, mesh=mesh, in_specs=in_specs,
+                               out_specs=out_specs, check_rep=False))
     payload_path = folder / 'checkpoint.pkl'
     if mode == 'save':
-        state = runner.run(*runner.reset(jax.random.PRNGKey(7)))[1:]
+        state = run(*runner.reset(jax.random.PRNGKey(7)))[1:]
+        if n_devices > 1:
+            assert any(len(x.addressable_shards) == n_devices
+                       for x in jax.tree_util.tree_leaves(state))
         payload = dict(producer_pid=os.getpid(), checkpoint=runner.get_checkpoint_state(state),
-                       current=_snapshot(state), next=_snapshot(runner.run(*state)))
+                       current=_snapshot(state), next=_snapshot(run(*state)))
         payload_path.write_bytes(pickle.dumps(payload))
     else:
         payload = pickle.loads(payload_path.read_bytes())
         restored = runner.load_checkpoint_state(runner.reset(jax.random.PRNGKey(99)),
                                                  payload['checkpoint'])
         _assert_snapshot(restored, payload['current'], exact=True)
-        _assert_snapshot(runner.run(*restored), payload['next'], exact=False)
+        next_state = run(*restored)
+        _assert_snapshot(next_state, payload['next'], exact=False)
+        if n_devices > 1:
+            assert any(len(x.addressable_shards) == n_devices
+                       for x in jax.tree_util.tree_leaves(next_state))
         (folder / 'result.json').write_text(json.dumps(dict(producer_pid=payload['producer_pid'],
             consumer_pid=os.getpid(), restored_leaves=len(payload['current']),
-            next_update_leaves=len(payload['next']))))
+            next_update_leaves=len(payload['next']), n_devices=n_devices)))
 
 
 @pytest.mark.parametrize('kind', ['dr', 'plr', 'paired'])
@@ -127,5 +147,19 @@ def test_checkpoint_continues_after_producer_process_exits(kind, tmp_path):
     assert receipt['restored_leaves'] > 0 and receipt['next_update_leaves'] > 0
 
 
+@pytest.mark.parametrize('kind', ['dr', 'plr', 'paired'])
+def test_multidevice_checkpoint_continues_after_producer_exits(kind, tmp_path):
+    if jax.local_device_count() < 2:
+        pytest.skip('Set XLA_FLAGS=--xla_force_host_platform_device_count=2')
+    for mode in ['save', 'load']:
+        result = subprocess.run([sys.executable, str(Path(__file__).resolve()), mode,
+                                 kind, str(tmp_path), '2'], capture_output=True, text=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+    receipt = json.loads((tmp_path / 'result.json').read_text())
+    assert receipt['restored_leaves'] > 0 and receipt['next_update_leaves'] > 0
+    assert receipt['n_devices'] == 2
+
+
 if __name__ == '__main__':
-    _checkpoint_worker(sys.argv[1], sys.argv[2], Path(sys.argv[3]))
+    _checkpoint_worker(sys.argv[1], sys.argv[2], Path(sys.argv[3]),
+                       int(sys.argv[4]) if len(sys.argv) > 4 else 1)
